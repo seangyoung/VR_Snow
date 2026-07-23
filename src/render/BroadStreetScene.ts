@@ -380,8 +380,10 @@ function resolvePublicAssetPath(path: string): string {
 
 function preparePanoramaTexture(texture: THREE.Texture): void {
   texture.colorSpace = THREE.SRGBColorSpace;
-  texture.wrapS = THREE.ClampToEdgeWrapping;
+  texture.wrapS = THREE.RepeatWrapping;
   texture.wrapT = THREE.ClampToEdgeWrapping;
+  texture.repeat.x = -1;
+  texture.offset.x = 1;
   texture.needsUpdate = true;
 }
 
