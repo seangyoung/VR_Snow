@@ -33,7 +33,15 @@ export class BroadStreetScene {
   private readonly hotspotWorldPosition = new THREE.Vector3();
   private readonly hotspotVisuals = new Map<string, HotspotVisual>();
   private readonly locationObjects = new Map<LocationId, THREE.Object3D[]>();
+  private readonly fallbackPanoramaTexture = createPanoramaTexture();
+  private readonly skyMaterial = new THREE.MeshBasicMaterial({
+    map: this.fallbackPanoramaTexture,
+    side: THREE.BackSide,
+  });
+  private readonly panoramaLoader = new THREE.TextureLoader();
+  private readonly panoramaTextureCache = new Map<LocationId, THREE.Texture | null>();
   private readonly allowCanvasCapture: boolean;
+  private activePanoramaLocationId?: LocationId;
   private focusedHotspot?: Hotspot;
   private captureFrameCounter = 0;
   private yaw = 0;
@@ -97,6 +105,7 @@ export class BroadStreetScene {
   applyCurrentLocation(): void {
     const location = this.gameState.getCurrentLocation();
     const target = locationLookTargets[location.id] ?? [0, 0, -4];
+    this.applyPanorama(location.id);
     this.yaw = Math.atan2(-target[0], -target[2]);
     this.pitch = THREE.MathUtils.clamp((target[1] - cameraHeight) * 0.12, -0.18, 0.18);
     this.camera.rotation.set(this.pitch, this.yaw, 0, "YXZ");
@@ -129,10 +138,7 @@ export class BroadStreetScene {
 
     const sky = new THREE.Mesh(
       new THREE.SphereGeometry(42, 64, 32),
-      new THREE.MeshBasicMaterial({
-        map: createPanoramaTexture(),
-        side: THREE.BackSide,
-      }),
+      this.skyMaterial,
     );
     this.scene.add(sky);
 
@@ -182,6 +188,48 @@ export class BroadStreetScene {
     const objects = this.locationObjects.get(locationId) ?? [];
     objects.push(object);
     this.locationObjects.set(locationId, objects);
+  }
+
+  private applyPanorama(locationId: LocationId): void {
+    this.activePanoramaLocationId = locationId;
+    this.setSkyTexture(this.fallbackPanoramaTexture);
+
+    const cachedTexture = this.panoramaTextureCache.get(locationId);
+    if (cachedTexture) {
+      this.setSkyTexture(cachedTexture);
+      return;
+    }
+
+    if (cachedTexture === null) {
+      return;
+    }
+
+    this.panoramaLoader.load(
+      resolvePublicAssetPath(panoramaAssetPaths[locationId]),
+      (texture) => {
+        preparePanoramaTexture(texture);
+        this.panoramaTextureCache.set(locationId, texture);
+        if (this.activePanoramaLocationId === locationId) {
+          this.setSkyTexture(texture);
+        }
+      },
+      undefined,
+      () => {
+        this.panoramaTextureCache.set(locationId, null);
+        if (this.activePanoramaLocationId === locationId) {
+          this.setSkyTexture(this.fallbackPanoramaTexture);
+        }
+      },
+    );
+  }
+
+  private setSkyTexture(texture: THREE.Texture): void {
+    if (this.skyMaterial.map === texture) {
+      return;
+    }
+
+    this.skyMaterial.map = texture;
+    this.skyMaterial.needsUpdate = true;
   }
 
   private addInputHandlers(): void {
@@ -313,6 +361,29 @@ const locationLookTargets: Record<LocationId, [number, number, number]> = {
   brewery: [3.4, 1.25, 1.8],
   "board-room": [0, 1.2, 2.8],
 };
+
+const panoramaAssetPaths: Record<LocationId, string> = {
+  "snow-desk": "panoramas/snow-desk.jpg",
+  "broad-street": "panoramas/broad-street.jpg",
+  household: "panoramas/household.jpg",
+  registrar: "panoramas/registrar.jpg",
+  workhouse: "panoramas/workhouse.jpg",
+  brewery: "panoramas/brewery.jpg",
+  "board-room": "panoramas/board-room.jpg",
+};
+
+function resolvePublicAssetPath(path: string): string {
+  const base = import.meta.env.BASE_URL || "/";
+  const normalizedBase = base.endsWith("/") ? base : `${base}/`;
+  return `${normalizedBase}${path}`;
+}
+
+function preparePanoramaTexture(texture: THREE.Texture): void {
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.wrapS = THREE.ClampToEdgeWrapping;
+  texture.wrapT = THREE.ClampToEdgeWrapping;
+  texture.needsUpdate = true;
+}
 
 function createHotspotMesh(hotspot: Hotspot): HotspotMesh {
   const material = new THREE.MeshStandardMaterial({
