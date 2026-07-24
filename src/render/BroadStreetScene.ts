@@ -1,7 +1,7 @@
 import * as THREE from "three";
 import { VRButton } from "three/addons/webxr/VRButton.js";
 import type { GameState } from "../simulation/gameState";
-import type { Hotspot, LocationId } from "../simulation/types";
+import type { Hotspot, HypothesisId, LocationId, SynthesisConfidence } from "../simulation/types";
 
 type HotspotMesh = THREE.Mesh<THREE.SphereGeometry, THREE.MeshStandardMaterial> & {
   userData: { hotspot: Hotspot };
@@ -10,6 +10,35 @@ type HotspotMesh = THREE.Mesh<THREE.SphereGeometry, THREE.MeshStandardMaterial> 
 type HotspotVisual = {
   mesh: HotspotMesh;
   label: THREE.Sprite;
+};
+
+type VrPanelMode = "home" | "map" | "notebook" | "synthesis";
+
+type VrButtonAction =
+  | { type: "mode"; mode: VrPanelMode }
+  | { type: "recenter" }
+  | { type: "travel"; locationId: LocationId }
+  | { type: "ask"; questionId: string }
+  | { type: "close-dialogue" }
+  | { type: "select-hypothesis"; hypothesisId: HypothesisId }
+  | { type: "set-confidence"; confidence: SynthesisConfidence }
+  | { type: "prepare-board" }
+  | { type: "present-board" }
+  | { type: "finish-board" }
+  | { type: "reset" };
+
+type VrButtonMesh = THREE.Mesh<THREE.PlaneGeometry, THREE.MeshBasicMaterial> & {
+  userData: {
+    vrButton: VrButtonAction;
+    baseScale: THREE.Vector3;
+  };
+};
+
+type VrTextOptions = {
+  color?: string;
+  background?: string;
+  fontSize?: number;
+  weight?: string;
 };
 
 type CaptureWindow = Window & {
@@ -24,16 +53,24 @@ export class BroadStreetScene {
 
   private readonly scene = new THREE.Scene();
   private readonly camera = new THREE.PerspectiveCamera(65, 1, 0.05, 100);
+  private readonly playerRig = new THREE.Group();
   private readonly renderer: THREE.WebGLRenderer;
   private readonly raycaster = new THREE.Raycaster();
+  private readonly controllerRaycaster = new THREE.Raycaster();
   private readonly pointer = new THREE.Vector2();
   private readonly cameraWorldPosition = new THREE.Vector3();
   private readonly cameraDirection = new THREE.Vector3();
   private readonly hotspotDirection = new THREE.Vector3();
   private readonly hotspotWorldPosition = new THREE.Vector3();
+  private readonly controllerWorldPosition = new THREE.Vector3();
+  private readonly controllerWorldDirection = new THREE.Vector3();
+  private readonly controllerWorldQuaternion = new THREE.Quaternion();
   private readonly hotspotVisuals = new Map<string, HotspotVisual>();
   private readonly locationObjects = new Map<LocationId, THREE.Object3D[]>();
   private readonly sharedExterior = new THREE.Group();
+  private readonly vrControllers: THREE.Group[] = [];
+  private readonly vrPanel = new THREE.Group();
+  private readonly vrPanelButtons: VrButtonMesh[] = [];
   private readonly fallbackPanoramaTexture = createPanoramaTexture();
   private readonly skyMaterial = new THREE.MeshBasicMaterial({
     map: this.fallbackPanoramaTexture,
@@ -50,6 +87,12 @@ export class BroadStreetScene {
   private captureFrameCounter = 0;
   private yaw = 0;
   private pitch = 0;
+  private vrPanelMode: VrPanelMode = "home";
+  private vrPanelDirty = true;
+  private vrPanelVisible = false;
+  private vrStatus = "Aim a controller ray at a marker. Trigger selects. Thumbstick left/right snap turns.";
+  private vrFocusedButton?: VrButtonMesh;
+  private snapTurnLocked = false;
   private dragging = false;
   private previousPointer = { x: 0, y: 0 };
 
@@ -74,7 +117,11 @@ export class BroadStreetScene {
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 
     this.camera.position.set(0, cameraHeight, 0);
-    this.scene.add(this.camera);
+    this.playerRig.add(this.camera);
+    this.scene.add(this.playerRig);
+    this.camera.add(this.vrPanel);
+    this.vrPanel.position.set(0, -0.4, -1.55);
+    this.vrPanel.visible = false;
 
     if (this.allowCanvasCapture) {
       (window as CaptureWindow).__vrSnowCapture = () => createCaptureDataUrl(this.renderer.domElement);
@@ -83,7 +130,7 @@ export class BroadStreetScene {
     this.buildScene();
     this.buildHotspots();
     this.addInputHandlers();
-    this.addVrButton();
+    this.addVrEntryButton();
     this.resize();
     this.applyCurrentLocation();
   }
@@ -91,6 +138,7 @@ export class BroadStreetScene {
   start(): void {
     this.renderer.setAnimationLoop((time: number) => {
       this.updateHotspots(time * 0.001);
+      this.updateVrControls();
       this.updateFocusFromCenter();
       this.renderer.render(this.scene, this.camera);
       if (this.allowCanvasCapture && this.captureFrameCounter % 12 === 0) {
@@ -103,7 +151,7 @@ export class BroadStreetScene {
   resetView(): void {
     this.yaw = 0;
     this.pitch = 0;
-    this.camera.rotation.set(0, 0, 0);
+    this.applyCameraOrientation();
   }
 
   applyCurrentLocation(): void {
@@ -112,11 +160,12 @@ export class BroadStreetScene {
     this.applyPanorama(location.id);
     this.yaw = Math.atan2(-target[0], -target[2]);
     this.pitch = THREE.MathUtils.clamp((target[1] - cameraHeight) * 0.12, -0.18, 0.18);
-    this.camera.rotation.set(this.pitch, this.yaw, 0, "YXZ");
+    this.applyCameraOrientation();
     this.focusedHotspot = undefined;
     this.onFocusChange?.(undefined);
     this.refreshLocationObjects();
     this.refreshHotspots();
+    this.markVrPanelDirty();
   }
 
   refreshHotspots(): void {
@@ -134,6 +183,8 @@ export class BroadStreetScene {
       this.focusedHotspot = undefined;
       this.onFocusChange?.(undefined);
     }
+
+    this.markVrPanelDirty();
   }
 
   private buildScene(): void {
@@ -247,6 +298,9 @@ export class BroadStreetScene {
   private addInputHandlers(): void {
     window.addEventListener("resize", () => this.resize());
     this.canvas.addEventListener("pointerdown", (event) => {
+      if (this.renderer.xr.isPresenting) {
+        return;
+      }
       this.dragging = true;
       this.previousPointer = { x: event.clientX, y: event.clientY };
       this.canvas.setPointerCapture(event.pointerId);
@@ -261,13 +315,18 @@ export class BroadStreetScene {
       this.yaw -= deltaX * 0.004;
       this.pitch -= deltaY * 0.003;
       this.pitch = THREE.MathUtils.clamp(this.pitch, -1.15, 1.15);
-      this.camera.rotation.set(this.pitch, this.yaw, 0, "YXZ");
+      this.applyCameraOrientation();
     });
     this.canvas.addEventListener("pointerup", (event) => {
       this.dragging = false;
-      this.canvas.releasePointerCapture(event.pointerId);
+      if (this.canvas.hasPointerCapture(event.pointerId)) {
+        this.canvas.releasePointerCapture(event.pointerId);
+      }
     });
     this.canvas.addEventListener("click", (event) => {
+      if (this.renderer.xr.isPresenting) {
+        return;
+      }
       const hotspot = this.pickHotspot(event.clientX, event.clientY);
       if (hotspot) {
         this.onHotspotActivate?.(hotspot);
@@ -281,16 +340,515 @@ export class BroadStreetScene {
       }
     });
 
-    const controller = this.renderer.xr.getController(0);
-    controller.addEventListener("select", () => {
-      if (this.focusedHotspot) {
-        this.onHotspotActivate?.(this.focusedHotspot);
-      }
-    });
-    this.scene.add(controller);
+    for (let index = 0; index < 2; index += 1) {
+      const controller = this.renderer.xr.getController(index);
+      controller.add(createControllerRay());
+      controller.addEventListener("select", () => this.selectFromVrController(controller));
+      controller.addEventListener("squeeze", () => this.toggleVrPanel());
+      this.scene.add(controller);
+      this.vrControllers.push(controller);
+    }
+
+    this.renderer.xr.addEventListener("sessionstart", () => this.handleVrSessionStart());
+    this.renderer.xr.addEventListener("sessionend", () => this.handleVrSessionEnd());
   }
 
-  private addVrButton(): void {
+  private handleVrSessionStart(): void {
+    this.vrPanelVisible = true;
+    this.vrPanel.visible = true;
+    this.vrPanelMode = "home";
+    this.vrStatus = "Aim a controller ray at a marker or panel button. Trigger selects. Thumbstick left/right snap turns.";
+    this.applyCameraOrientation();
+    this.markVrPanelDirty();
+  }
+
+  private handleVrSessionEnd(): void {
+    this.vrPanelVisible = false;
+    this.vrPanel.visible = false;
+    this.snapTurnLocked = false;
+    this.playerRig.rotation.set(0, 0, 0);
+    this.camera.rotation.set(this.pitch, this.yaw, 0, "YXZ");
+  }
+
+  private toggleVrPanel(): void {
+    if (!this.renderer.xr.isPresenting) {
+      return;
+    }
+
+    this.vrPanelVisible = !this.vrPanelVisible;
+    this.vrPanel.visible = this.vrPanelVisible;
+    this.markVrPanelDirty();
+  }
+
+  private updateVrControls(): void {
+    if (!this.renderer.xr.isPresenting) {
+      return;
+    }
+
+    if (this.vrPanelDirty) {
+      this.rebuildVrPanel();
+    }
+
+    this.updateVrButtonFocus();
+    this.updateSnapTurn();
+  }
+
+  private selectFromVrController(controller: THREE.Group): void {
+    const button = this.pickVrButton(controller);
+    if (button) {
+      this.handleVrButton(button.userData.vrButton);
+      return;
+    }
+
+    const hotspot = this.pickVrHotspot(controller);
+    if (hotspot) {
+      this.activateVrHotspot(hotspot);
+      return;
+    }
+
+    if (this.focusedHotspot) {
+      this.activateVrHotspot(this.focusedHotspot);
+    }
+  }
+
+  private activateVrHotspot(hotspot: Hotspot): void {
+    this.vrPanelVisible = true;
+    this.vrPanel.visible = true;
+    this.vrPanelMode = "home";
+
+    if (
+      hotspot.id === "john-snow" &&
+      this.gameState.getStage() === "synthesis" &&
+      this.gameState.getCurrentLocation().id === "snow-desk"
+    ) {
+      this.vrPanelMode = "synthesis";
+      this.vrStatus = "Snow turns to the map table. Test the evidence against the competing theories.";
+      this.markVrPanelDirty();
+      return;
+    }
+
+    const result = this.gameState.inspectHotspot(hotspot.id);
+    this.vrStatus = result.message;
+    this.refreshHotspots();
+    this.markVrPanelDirty();
+  }
+
+  private handleVrButton(action: VrButtonAction): void {
+    switch (action.type) {
+      case "mode":
+        this.vrPanelMode = action.mode;
+        this.vrStatus = this.getDefaultVrStatus();
+        break;
+      case "recenter":
+        this.recenterToCurrentLocation();
+        this.vrStatus = "View recentered on the current investigation point.";
+        break;
+      case "travel": {
+        const result = this.gameState.travelToLocation(action.locationId);
+        this.vrPanelMode = "home";
+        this.vrStatus = result.message;
+        break;
+      }
+      case "ask": {
+        const result = this.gameState.askQuestion(action.questionId);
+        this.vrPanelMode = "home";
+        this.vrStatus = result.response ? `${result.message} ${result.response}` : result.message;
+        break;
+      }
+      case "close-dialogue":
+        this.gameState.closeDialogue();
+        this.vrStatus = "Conversation closed.";
+        break;
+      case "select-hypothesis": {
+        const result = this.gameState.selectHypothesis(action.hypothesisId);
+        this.vrPanelMode = "synthesis";
+        this.vrStatus = result.message;
+        break;
+      }
+      case "set-confidence": {
+        const result = this.gameState.setSynthesisConfidence(action.confidence);
+        this.vrPanelMode = "synthesis";
+        this.vrStatus = result.message;
+        break;
+      }
+      case "prepare-board": {
+        const result = this.gameState.prepareBoardArgument();
+        this.vrPanelMode = "synthesis";
+        this.vrStatus = result.message;
+        break;
+      }
+      case "present-board": {
+        const result = this.gameState.presentToBoard();
+        this.vrPanelMode = "synthesis";
+        this.vrStatus = result.message;
+        break;
+      }
+      case "finish-board":
+        this.gameState.finishBoard();
+        this.vrPanelMode = "synthesis";
+        this.vrStatus = "The meeting is over. The parish waits to see what follows.";
+        break;
+      case "reset":
+        this.gameState.reset();
+        this.vrPanelMode = "home";
+        this.vrStatus = "Investigation reset.";
+        break;
+    }
+
+    this.vrPanelVisible = true;
+    this.vrPanel.visible = true;
+    this.refreshHotspots();
+    this.markVrPanelDirty();
+  }
+
+  private getDefaultVrStatus(): string {
+    if (this.vrPanelMode === "map") {
+      return "Choose a location to travel by map.";
+    }
+
+    if (this.vrPanelMode === "notebook") {
+      return "Collected evidence appears here as the inquiry develops.";
+    }
+
+    if (this.vrPanelMode === "synthesis") {
+      return "Choose a theory, state your confidence, and decide what to tell the Board.";
+    }
+
+    return "Aim a controller ray at a marker or panel button. Trigger selects. Thumbstick left/right snap turns.";
+  }
+
+  private rebuildVrPanel(): void {
+    this.vrPanelDirty = false;
+    this.clearVrPanel();
+
+    if (!this.vrPanelVisible) {
+      this.vrPanel.visible = false;
+      return;
+    }
+
+    const background = new THREE.Mesh(
+      new THREE.PlaneGeometry(2.35, 1.38),
+      new THREE.MeshBasicMaterial({
+        color: "#101719",
+        transparent: true,
+        opacity: 0.9,
+        depthTest: false,
+        toneMapped: false,
+      }),
+    );
+    background.renderOrder = 30;
+    this.vrPanel.add(background);
+
+    const currentLocation = this.gameState.getCurrentLocation();
+    this.addVrText(currentLocation.title, 0, 0.57, 2.05, 0.14, {
+      color: "#f6deb0",
+      fontSize: 42,
+      weight: "700",
+    });
+    this.addVrText(this.gameState.getObjective(), 0, 0.41, 2.05, 0.16, {
+      color: "#d9e5e1",
+      fontSize: 25,
+    });
+
+    if (this.vrPanelMode === "map") {
+      this.buildVrMapPanel();
+    } else if (this.vrPanelMode === "notebook") {
+      this.buildVrNotebookPanel();
+    } else if (this.vrPanelMode === "synthesis") {
+      this.buildVrSynthesisPanel();
+    } else {
+      this.buildVrHomePanel();
+    }
+
+    this.addVrText(this.vrStatus, 0, -0.57, 2.05, 0.17, {
+      color: "#b9c9c4",
+      fontSize: 21,
+    });
+  }
+
+  private buildVrHomePanel(): void {
+    this.addVrPanelButton("Map", -0.7, 0.2, 0.56, 0.17, { type: "mode", mode: "map" });
+    this.addVrPanelButton("Notebook", 0, 0.2, 0.66, 0.17, { type: "mode", mode: "notebook" });
+    this.addVrPanelButton("Recenter", 0.72, 0.2, 0.62, 0.17, { type: "recenter" });
+
+    const activeDialogue = this.gameState.getActiveDialogue();
+    if (activeDialogue) {
+      this.addVrText(`${activeDialogue.speaker}: ${activeDialogue.role}`, 0, 0.03, 2.05, 0.12, {
+        color: "#f1d79c",
+        fontSize: 27,
+        weight: "700",
+      });
+      this.addVrText(activeDialogue.intro, 0, -0.12, 2.05, 0.17, {
+        color: "#e7ece8",
+        fontSize: 22,
+      });
+
+      activeDialogue.questions.slice(0, 3).forEach((question, index) => {
+        const recorded = this.gameState.hasAskedQuestion(question.id) ? "Recorded: " : "";
+        this.addVrPanelButton(`${recorded}${question.prompt}`, 0, -0.3 - index * 0.16, 1.96, 0.13, {
+          type: "ask",
+          questionId: question.id,
+        });
+      });
+      this.addVrPanelButton("Close Talk", 0.74, -0.48, 0.58, 0.13, { type: "close-dialogue" });
+      return;
+    }
+
+    if (this.gameState.getStage() === "synthesis" && this.gameState.getCurrentLocation().id === "snow-desk") {
+      this.addVrText("Snow is ready to test the evidence against the possible causes.", 0, -0.02, 2.05, 0.18, {
+        color: "#e7ece8",
+        fontSize: 25,
+      });
+      this.addVrPanelButton("Snow Review", 0, -0.22, 0.9, 0.17, { type: "mode", mode: "synthesis" });
+      return;
+    }
+
+    if (this.gameState.getStage() === "board") {
+      this.addVrText("The Board has heard the argument. Record what follows.", 0, -0.02, 2.05, 0.18, {
+        color: "#e7ece8",
+        fontSize: 25,
+      });
+      this.addVrPanelButton("After the Meeting", 0, -0.22, 0.95, 0.17, { type: "finish-board" });
+      return;
+    }
+
+    if (this.gameState.getStage() === "complete") {
+      this.addVrText(this.gameState.getCurrentSceneBody().join(" "), 0, -0.08, 2.05, 0.35, {
+        color: "#e7ece8",
+        fontSize: 22,
+      });
+      this.addVrPanelButton("Reset", 0, -0.36, 0.54, 0.16, { type: "reset" });
+      return;
+    }
+
+    this.addVrText("Point at a gold marker in the scene and pull the trigger to inspect it.", 0, -0.07, 2.05, 0.18, {
+      color: "#e7ece8",
+      fontSize: 25,
+    });
+  }
+
+  private buildVrMapPanel(): void {
+    const locations = this.gameState
+      .getLocations()
+      .filter((location) => this.gameState.canTravelToLocation(location.id) && location.id !== this.gameState.getCurrentLocation().id);
+
+    if (locations.length === 0) {
+      this.addVrText("No other field locations are available yet.", 0, 0.08, 2.05, 0.18, {
+        color: "#e7ece8",
+        fontSize: 25,
+      });
+    }
+
+    locations.slice(0, 8).forEach((location, index) => {
+      const column = index % 2 === 0 ? -0.52 : 0.52;
+      const row = Math.floor(index / 2);
+      this.addVrPanelButton(location.shortTitle, column, 0.2 - row * 0.17, 0.95, 0.14, {
+        type: "travel",
+        locationId: location.id,
+      });
+    });
+
+    this.addVrPanelButton("Back", 0, -0.4, 0.48, 0.15, { type: "mode", mode: "home" });
+  }
+
+  private buildVrNotebookPanel(): void {
+    const evidence = this.gameState.getCollectedEvidence();
+    this.addVrText(`Evidence recorded: ${this.gameState.getProgressText()}`, 0, 0.18, 2.05, 0.12, {
+      color: "#f1d79c",
+      fontSize: 28,
+      weight: "700",
+    });
+
+    if (evidence.length === 0) {
+      this.addVrText("No evidence cards have been recorded yet.", 0, 0, 2.05, 0.16, {
+        color: "#e7ece8",
+        fontSize: 25,
+      });
+    } else {
+      this.addVrText(
+        evidence
+          .slice(-5)
+          .map((card) => card.title)
+          .join("  |  "),
+        0,
+        -0.1,
+        2.05,
+        0.32,
+        { color: "#e7ece8", fontSize: 23 },
+      );
+    }
+
+    this.addVrPanelButton("Back", 0, -0.42, 0.48, 0.15, { type: "mode", mode: "home" });
+  }
+
+  private buildVrSynthesisPanel(): void {
+    const stage = this.gameState.getStage();
+    if (stage === "board" || stage === "complete") {
+      this.addVrText(this.gameState.getCurrentSceneBody().join(" "), 0, 0.08, 2.05, 0.34, {
+        color: "#e7ece8",
+        fontSize: 22,
+      });
+      this.addVrPanelButton(stage === "board" ? "After the Meeting" : "Reset", 0, -0.32, 0.85, 0.16, {
+        type: stage === "board" ? "finish-board" : "reset",
+      });
+      this.addVrPanelButton("Back", 0.66, -0.32, 0.48, 0.16, { type: "mode", mode: "home" });
+      return;
+    }
+
+    const selected = this.gameState.getSelectedHypothesis();
+    const confidence = this.gameState.synthesisConfidence;
+    this.addVrText("Theory", -0.56, 0.22, 0.9, 0.11, { color: "#f1d79c", fontSize: 26, weight: "700" });
+    this.addVrText("Confidence", 0.58, 0.22, 0.9, 0.11, { color: "#f1d79c", fontSize: 26, weight: "700" });
+
+    this.gameState.getHypotheses().forEach((hypothesis, index) => {
+      const label = selected?.id === hypothesis.id ? `Selected: ${hypothesis.shortTitle}` : hypothesis.shortTitle;
+      this.addVrPanelButton(label, -0.56, 0.05 - index * 0.14, 0.96, 0.12, {
+        type: "select-hypothesis",
+        hypothesisId: hypothesis.id,
+      });
+    });
+
+    const confidenceOptions: Array<{ id: SynthesisConfidence; label: string }> = [
+      { id: "tentative", label: "Tentative" },
+      { id: "proportionate", label: "Temporary action" },
+      { id: "overstated", label: "Final proof" },
+    ];
+    confidenceOptions.forEach((option, index) => {
+      const label = confidence === option.id ? `Set: ${option.label}` : option.label;
+      this.addVrPanelButton(label, 0.58, 0.05 - index * 0.14, 0.96, 0.12, {
+        type: "set-confidence",
+        confidence: option.id,
+      });
+    });
+
+    this.addVrPanelButton("Prepare Board Argument", -0.34, -0.42, 1.12, 0.15, { type: "prepare-board" });
+    this.addVrPanelButton("Present to Board", 0.68, -0.42, 0.76, 0.15, { type: "present-board" });
+  }
+
+  private addVrText(text: string, x: number, y: number, width: number, height: number, options: VrTextOptions = {}): void {
+    const mesh = createVrTextPlane(text, width, height, options);
+    mesh.position.set(x, y, 0.02);
+    this.vrPanel.add(mesh);
+  }
+
+  private addVrPanelButton(label: string, x: number, y: number, width: number, height: number, action: VrButtonAction): void {
+    const button = createVrButton(label, width, height, action);
+    button.position.set(x, y, 0.04);
+    button.userData.baseScale = button.scale.clone();
+    this.vrPanelButtons.push(button);
+    this.vrPanel.add(button);
+  }
+
+  private clearVrPanel(): void {
+    [...this.vrPanel.children].forEach((child) => {
+      this.vrPanel.remove(child);
+      disposeObjectTree(child);
+    });
+    this.vrPanelButtons.length = 0;
+    this.vrFocusedButton = undefined;
+  }
+
+  private markVrPanelDirty(): void {
+    this.vrPanelDirty = true;
+  }
+
+  private applyCameraOrientation(): void {
+    if (this.renderer.xr.isPresenting) {
+      this.playerRig.rotation.y = this.yaw;
+      this.camera.rotation.set(0, 0, 0);
+      return;
+    }
+
+    this.playerRig.rotation.set(0, 0, 0);
+    this.camera.rotation.set(this.pitch, this.yaw, 0, "YXZ");
+  }
+
+  private recenterToCurrentLocation(): void {
+    const location = this.gameState.getCurrentLocation();
+    const target = locationLookTargets[location.id] ?? [0, 0, -4];
+    this.yaw = Math.atan2(-target[0], -target[2]);
+    this.pitch = THREE.MathUtils.clamp((target[1] - cameraHeight) * 0.12, -0.18, 0.18);
+    this.applyCameraOrientation();
+  }
+
+  private updateVrButtonFocus(): void {
+    let nextButton: VrButtonMesh | undefined;
+    for (const controller of this.vrControllers) {
+      nextButton = this.pickVrButton(controller);
+      if (nextButton) {
+        break;
+      }
+    }
+
+    if (nextButton === this.vrFocusedButton) {
+      return;
+    }
+
+    if (this.vrFocusedButton) {
+      this.vrFocusedButton.scale.copy(this.vrFocusedButton.userData.baseScale);
+      this.vrFocusedButton.material.color.set("#ffffff");
+    }
+
+    this.vrFocusedButton = nextButton;
+
+    if (this.vrFocusedButton) {
+      this.vrFocusedButton.scale.copy(this.vrFocusedButton.userData.baseScale).multiplyScalar(1.06);
+      this.vrFocusedButton.material.color.set("#d9ecff");
+    }
+  }
+
+  private updateSnapTurn(): void {
+    let turnAxis = 0;
+    for (const controller of this.vrControllers) {
+      const inputSource = controller.userData.inputSource as { gamepad?: Gamepad } | undefined;
+      const axes = inputSource?.gamepad?.axes ?? [];
+      const candidate = Math.abs(axes[2] ?? 0) > Math.abs(axes[0] ?? 0) ? (axes[2] ?? 0) : (axes[0] ?? 0);
+      if (Math.abs(candidate) > Math.abs(turnAxis)) {
+        turnAxis = candidate;
+      }
+    }
+
+    if (Math.abs(turnAxis) < 0.25) {
+      this.snapTurnLocked = false;
+      return;
+    }
+
+    if (this.snapTurnLocked || Math.abs(turnAxis) < 0.75) {
+      return;
+    }
+
+    this.yaw -= Math.sign(turnAxis) * Math.PI * 0.25;
+    this.applyCameraOrientation();
+    this.snapTurnLocked = true;
+  }
+
+  private pickVrButton(controller: THREE.Group): VrButtonMesh | undefined {
+    if (!this.vrPanelVisible || this.vrPanelButtons.length === 0) {
+      return undefined;
+    }
+
+    this.setRaycasterFromController(controller);
+    const hit = this.controllerRaycaster.intersectObjects(this.vrPanelButtons, false)[0];
+    return hit ? (hit.object as VrButtonMesh) : undefined;
+  }
+
+  private pickVrHotspot(controller: THREE.Group): Hotspot | undefined {
+    this.setRaycasterFromController(controller);
+    const visibleHotspots = [...this.hotspotVisuals.values()].map((visual) => visual.mesh).filter((mesh) => mesh.visible);
+    const hit = this.controllerRaycaster.intersectObjects(visibleHotspots, false)[0];
+    return hit ? (hit.object as HotspotMesh).userData.hotspot : undefined;
+  }
+
+  private setRaycasterFromController(controller: THREE.Group): void {
+    controller.getWorldPosition(this.controllerWorldPosition);
+    controller.getWorldQuaternion(this.controllerWorldQuaternion);
+    this.controllerWorldDirection.set(0, 0, -1).applyQuaternion(this.controllerWorldQuaternion).normalize();
+    this.controllerRaycaster.set(this.controllerWorldPosition, this.controllerWorldDirection);
+    this.controllerRaycaster.near = 0;
+    this.controllerRaycaster.far = 12;
+  }
+
+  private addVrEntryButton(): void {
     const button = VRButton.createButton(this.renderer);
     button.classList.add("vr-entry-button");
     document.body.appendChild(button);
@@ -321,7 +879,7 @@ export class BroadStreetScene {
     this.camera.getWorldDirection(this.cameraDirection);
 
     let nextHotspot: Hotspot | undefined;
-    let closestAngle = 0.18;
+    let closestAngle = this.renderer.xr.isPresenting ? 0.28 : 0.18;
     this.hotspotVisuals.forEach(({ mesh }) => {
       if (!mesh.visible) {
         return;
@@ -365,6 +923,134 @@ export class BroadStreetScene {
       });
     });
   }
+}
+
+function createControllerRay(): THREE.Line {
+  const geometry = new THREE.BufferGeometry().setFromPoints([
+    new THREE.Vector3(0, 0, 0),
+    new THREE.Vector3(0, 0, -4.5),
+  ]);
+  const material = new THREE.LineBasicMaterial({
+    color: "#f4d891",
+    transparent: true,
+    opacity: 0.82,
+    toneMapped: false,
+  });
+  const line = new THREE.Line(geometry, material);
+  line.renderOrder = 80;
+  return line;
+}
+
+function createVrTextPlane(text: string, width: number, height: number, options: VrTextOptions = {}): THREE.Mesh {
+  const canvas = document.createElement("canvas");
+  canvas.width = 1024;
+  canvas.height = Math.max(128, Math.round((height / width) * canvas.width));
+  const ctx = canvas.getContext("2d");
+  if (!ctx) {
+    throw new Error("Could not create VR panel text.");
+  }
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (options.background) {
+    ctx.fillStyle = options.background;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+  }
+
+  const fontSize = options.fontSize ?? 24;
+  const padding = 24;
+  const lineHeight = fontSize * 1.22;
+  ctx.font = `${options.weight ?? "500"} ${fontSize}px Inter, Arial, sans-serif`;
+  ctx.fillStyle = options.color ?? "#ffffff";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+
+  const lines = wrapCanvasText(ctx, text, canvas.width - padding * 2, Math.floor((canvas.height - padding) / lineHeight));
+  const startY = canvas.height / 2 - ((lines.length - 1) * lineHeight) / 2;
+  lines.forEach((line, index) => {
+    ctx.fillText(line, canvas.width / 2, startY + index * lineHeight);
+  });
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.needsUpdate = true;
+
+  const material = new THREE.MeshBasicMaterial({
+    map: texture,
+    transparent: true,
+    depthTest: false,
+    toneMapped: false,
+  });
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(width, height), material);
+  mesh.renderOrder = 50;
+  return mesh;
+}
+
+function createVrButton(label: string, width: number, height: number, action: VrButtonAction): VrButtonMesh {
+  const mesh = createVrTextPlane(label, width, height, {
+    background: "#274149",
+    color: "#f8f1dc",
+    fontSize: height < 0.14 ? 20 : 23,
+    weight: "700",
+  }) as VrButtonMesh;
+  mesh.material.color.set("#ffffff");
+  mesh.userData = {
+    vrButton: action,
+    baseScale: new THREE.Vector3(1, 1, 1),
+  };
+  return mesh;
+}
+
+function wrapCanvasText(
+  ctx: CanvasRenderingContext2D,
+  text: string,
+  maxWidth: number,
+  maxLines: number,
+): string[] {
+  const words = text.replace(/\s+/g, " ").trim().split(" ").filter(Boolean);
+  const lines: string[] = [];
+  let currentLine = "";
+
+  words.forEach((word) => {
+    const candidate = currentLine ? `${currentLine} ${word}` : word;
+    if (ctx.measureText(candidate).width <= maxWidth || currentLine.length === 0) {
+      currentLine = candidate;
+      return;
+    }
+
+    lines.push(currentLine);
+    currentLine = word;
+  });
+
+  if (currentLine) {
+    lines.push(currentLine);
+  }
+
+  if (lines.length > maxLines) {
+    const trimmed = lines.slice(0, maxLines);
+    const finalLine = trimmed[trimmed.length - 1] ?? "";
+    trimmed[trimmed.length - 1] = finalLine.length > 3 ? `${finalLine.slice(0, -3)}...` : "...";
+    return trimmed;
+  }
+
+  return lines.length > 0 ? lines : [""];
+}
+
+function disposeObjectTree(object: THREE.Object3D): void {
+  object.traverse((child) => {
+    const mesh = child as THREE.Mesh;
+    if (mesh.geometry) {
+      mesh.geometry.dispose();
+    }
+
+    const materials = Array.isArray(mesh.material) ? mesh.material : mesh.material ? [mesh.material] : [];
+    materials.forEach((material) => {
+      const mappedMaterial = material as THREE.Material & { map?: THREE.Texture };
+      if (mappedMaterial.map) {
+        mappedMaterial.map.dispose();
+      }
+      material.dispose();
+    });
+  });
 }
 
 const locationLookTargets: Record<LocationId, [number, number, number]> = {
@@ -443,7 +1129,7 @@ function createHotspotMesh(hotspot: Hotspot): HotspotMesh {
     emissiveIntensity: 0.85,
     roughness: 0.45,
   });
-  const mesh = new THREE.Mesh(new THREE.SphereGeometry(0.2, 24, 16), material) as HotspotMesh;
+  const mesh = new THREE.Mesh(new THREE.SphereGeometry(0.3, 24, 16), material) as HotspotMesh;
   mesh.position.set(...hotspot.position);
   mesh.userData = { hotspot };
   return mesh;
