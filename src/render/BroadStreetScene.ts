@@ -369,7 +369,7 @@ export class BroadStreetScene {
 
 const locationLookTargets: Record<LocationId, [number, number, number]> = {
   "snow-desk": [-2.8, 1.35, 2.4],
-  "broad-street": [0, 1.1, -4.2],
+  "broad-street": [0.8, 1.1, -4.2],
   household: [-2.25, 1.18, -0.95],
   registrar: [-3.2, 1.1, -2.2],
   workhouse: [3.6, 1.2, -1.7],
@@ -555,17 +555,19 @@ function createDistantStreetSilhouette(): THREE.Group {
 function createBroadStreetSet(): THREE.Group {
   const group = new THREE.Group();
   group.position.set(0, 0, -4.2);
+  const pumpX = 1.45;
 
   const streetSign = createSignMesh("BROAD STREET", 1.28, 0.28, "#e0d2aa", "#2b241c");
-  streetSign.position.set(-1.25, 1.86, -1.86);
+  streetSign.position.set(pumpX - 0.5, 1.86, -1.86);
   group.add(streetSign);
 
-  group.add(createPump());
-  group.add(createStreetLamp([-1.95, 0, 0.72]));
-  group.add(createBucket([0.62, 0.02, 0.34]));
-  group.add(createSampleVial([-0.35, 0.03, 0.56]));
-  group.add(createBox([0.9, 0.012, 0.55], createMaterial("#263b3a", { transparent: true, opacity: 0.58 }), [0.38, 0.025, 0.25], [0, 0.28, 0]));
-  group.add(createPointLight("#f2bc76", 48, 7.5, [-1.9, 2.25, 0.65]));
+  const pump = createPump();
+  pump.position.x = pumpX;
+  group.add(pump);
+  group.add(createBucket([pumpX + 0.62, 0.02, 0.34]));
+  group.add(createSampleVial([pumpX - 0.35, 0.03, 0.56]));
+  group.add(createBox([0.9, 0.012, 0.55], createMaterial("#263b3a", { transparent: true, opacity: 0.58 }), [pumpX + 0.38, 0.025, 0.25], [0, 0.28, 0]));
+  group.add(createPointLight("#f2bc76", 44, 6.5, [pumpX - 0.45, 2.2, 0.65]));
   return group;
 }
 
@@ -1009,17 +1011,6 @@ function createShelf(position: Vec3, shelfMaterial: THREE.MeshStandardMaterial, 
       );
     }
   }
-  return group;
-}
-
-function createStreetLamp(position: Vec3): THREE.Group {
-  const group = new THREE.Group();
-  group.position.set(...position);
-  const metal = createMaterial("#1f2221", { roughness: 0.46, metalness: 0.45 });
-  const glass = createMaterial("#d6aa62", { emissive: "#bd7d2e", emissiveIntensity: 0.42, roughness: 0.25 });
-  group.add(createCylinder(0.035, 0.045, 1.8, metal, [0, 0.9, 0], [0, 0, 0], 14));
-  group.add(createBox([0.28, 0.3, 0.28], glass, [0, 1.85, 0]));
-  group.add(createBox([0.34, 0.05, 0.34], metal, [0, 2.03, 0]));
   return group;
 }
 
