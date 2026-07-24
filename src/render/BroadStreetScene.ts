@@ -34,6 +34,12 @@ type VrButtonMesh = THREE.Mesh<THREE.PlaneGeometry, THREE.MeshBasicMaterial> & {
   };
 };
 
+type VrControllerPointer = {
+  group: THREE.Group;
+  beam: THREE.Mesh<THREE.CylinderGeometry, THREE.MeshBasicMaterial>;
+  reticle: THREE.Mesh<THREE.RingGeometry, THREE.MeshBasicMaterial>;
+};
+
 type VrTextOptions = {
   color?: string;
   background?: string;
@@ -65,10 +71,14 @@ export class BroadStreetScene {
   private readonly controllerWorldPosition = new THREE.Vector3();
   private readonly controllerWorldDirection = new THREE.Vector3();
   private readonly controllerWorldQuaternion = new THREE.Quaternion();
+  private readonly vrPanelWorldPosition = new THREE.Vector3();
+  private readonly vrPanelWorldDirection = new THREE.Vector3();
+  private readonly vrPanelLookTarget = new THREE.Vector3();
   private readonly hotspotVisuals = new Map<string, HotspotVisual>();
   private readonly locationObjects = new Map<LocationId, THREE.Object3D[]>();
   private readonly sharedExterior = new THREE.Group();
   private readonly vrControllers: THREE.Group[] = [];
+  private readonly vrControllerPointers: VrControllerPointer[] = [];
   private readonly vrPanel = new THREE.Group();
   private readonly vrPanelButtons: VrButtonMesh[] = [];
   private readonly fallbackPanoramaTexture = createPanoramaTexture();
@@ -90,7 +100,7 @@ export class BroadStreetScene {
   private vrPanelMode: VrPanelMode = "home";
   private vrPanelDirty = true;
   private vrPanelVisible = false;
-  private vrStatus = "Aim a controller ray at a marker. Trigger selects. Thumbstick left/right snap turns.";
+  private vrStatus = "Aim the controller beam at a marker or panel. Trigger selects. Squeeze toggles the panel.";
   private vrFocusedButton?: VrButtonMesh;
   private snapTurnLocked = false;
   private dragging = false;
@@ -119,8 +129,8 @@ export class BroadStreetScene {
     this.camera.position.set(0, cameraHeight, 0);
     this.playerRig.add(this.camera);
     this.scene.add(this.playerRig);
-    this.camera.add(this.vrPanel);
-    this.vrPanel.position.set(0, -0.4, -1.55);
+    this.scene.add(this.vrPanel);
+    this.vrPanel.scale.setScalar(0.72);
     this.vrPanel.visible = false;
 
     if (this.allowCanvasCapture) {
@@ -165,6 +175,9 @@ export class BroadStreetScene {
     this.onFocusChange?.(undefined);
     this.refreshLocationObjects();
     this.refreshHotspots();
+    if (this.renderer.xr.isPresenting && this.vrPanelVisible) {
+      this.placeVrPanelInFront();
+    }
     this.markVrPanelDirty();
   }
 
@@ -342,11 +355,13 @@ export class BroadStreetScene {
 
     for (let index = 0; index < 2; index += 1) {
       const controller = this.renderer.xr.getController(index);
-      controller.add(createControllerRay());
+      const pointer = createControllerPointer();
+      controller.add(pointer.group);
       controller.addEventListener("select", () => this.selectFromVrController(controller));
       controller.addEventListener("squeeze", () => this.toggleVrPanel());
-      this.scene.add(controller);
+      this.playerRig.add(controller);
       this.vrControllers.push(controller);
+      this.vrControllerPointers.push(pointer);
     }
 
     this.renderer.xr.addEventListener("sessionstart", () => this.handleVrSessionStart());
@@ -357,8 +372,9 @@ export class BroadStreetScene {
     this.vrPanelVisible = true;
     this.vrPanel.visible = true;
     this.vrPanelMode = "home";
-    this.vrStatus = "Aim a controller ray at a marker or panel button. Trigger selects. Thumbstick left/right snap turns.";
+    this.vrStatus = "Aim the controller beam at a marker or panel. Trigger selects. Squeeze toggles the panel.";
     this.applyCameraOrientation();
+    this.placeVrPanelInFront();
     this.markVrPanelDirty();
   }
 
@@ -377,6 +393,9 @@ export class BroadStreetScene {
 
     this.vrPanelVisible = !this.vrPanelVisible;
     this.vrPanel.visible = this.vrPanelVisible;
+    if (this.vrPanelVisible) {
+      this.placeVrPanelInFront();
+    }
     this.markVrPanelDirty();
   }
 
@@ -389,6 +408,7 @@ export class BroadStreetScene {
       this.rebuildVrPanel();
     }
 
+    this.updateVrPointers();
     this.updateVrButtonFocus();
     this.updateSnapTurn();
   }
@@ -412,9 +432,13 @@ export class BroadStreetScene {
   }
 
   private activateVrHotspot(hotspot: Hotspot): void {
+    const wasPanelVisible = this.vrPanelVisible;
     this.vrPanelVisible = true;
     this.vrPanel.visible = true;
     this.vrPanelMode = "home";
+    if (!wasPanelVisible) {
+      this.placeVrPanelInFront();
+    }
 
     if (
       hotspot.id === "john-snow" &&
@@ -441,6 +465,7 @@ export class BroadStreetScene {
         break;
       case "recenter":
         this.recenterToCurrentLocation();
+        this.placeVrPanelInFront();
         this.vrStatus = "View recentered on the current investigation point.";
         break;
       case "travel": {
@@ -514,7 +539,7 @@ export class BroadStreetScene {
       return "Choose a theory, state your confidence, and decide what to tell the Board.";
     }
 
-    return "Aim a controller ray at a marker or panel button. Trigger selects. Thumbstick left/right snap turns.";
+    return "Aim the controller beam at a marker or panel. Trigger selects. Squeeze toggles the panel.";
   }
 
   private rebuildVrPanel(): void {
@@ -771,6 +796,29 @@ export class BroadStreetScene {
     this.applyCameraOrientation();
   }
 
+  private placeVrPanelInFront(): void {
+    this.camera.getWorldPosition(this.vrPanelWorldPosition);
+    this.camera.getWorldDirection(this.vrPanelWorldDirection);
+    this.vrPanelWorldDirection.y = 0;
+    if (this.vrPanelWorldDirection.lengthSq() < 0.0001) {
+      this.vrPanelWorldDirection.set(0, 0, -1);
+    }
+    this.vrPanelWorldDirection.normalize();
+
+    const distance = 2.25;
+    this.vrPanel.position
+      .copy(this.vrPanelWorldPosition)
+      .addScaledVector(this.vrPanelWorldDirection, distance);
+    this.vrPanel.position.y = Math.max(1.05, this.vrPanelWorldPosition.y - 0.18);
+
+    this.vrPanelLookTarget.set(this.vrPanelWorldPosition.x, this.vrPanel.position.y, this.vrPanelWorldPosition.z);
+    const yawToCamera = Math.atan2(
+      this.vrPanelLookTarget.x - this.vrPanel.position.x,
+      this.vrPanelLookTarget.z - this.vrPanel.position.z,
+    );
+    this.vrPanel.rotation.set(0, yawToCamera, 0);
+  }
+
   private updateVrButtonFocus(): void {
     let nextButton: VrButtonMesh | undefined;
     for (const controller of this.vrControllers) {
@@ -822,6 +870,30 @@ export class BroadStreetScene {
     this.snapTurnLocked = true;
   }
 
+  private updateVrPointers(): void {
+    this.vrControllers.forEach((controller, index) => {
+      const pointer = this.vrControllerPointers[index];
+      if (!pointer) {
+        return;
+      }
+
+      const hit = this.pickVrPointerHit(controller);
+      const distance = THREE.MathUtils.clamp(hit?.distance ?? 4.5, 0.18, 4.5);
+      pointer.group.visible = true;
+      pointer.beam.position.z = -distance / 2;
+      pointer.beam.scale.set(1, 1, distance);
+      pointer.reticle.position.z = -distance;
+
+      const isButton = hit ? this.vrPanelButtons.includes(hit.object as VrButtonMesh) : false;
+      const color = isButton ? "#8fd3ff" : hit ? "#f4d891" : "#d7e7ff";
+      pointer.beam.material.color.set(color);
+      pointer.reticle.material.color.set(color);
+      pointer.beam.material.opacity = hit ? 0.9 : 0.52;
+      pointer.reticle.material.opacity = hit ? 0.95 : 0.42;
+      pointer.reticle.scale.setScalar(hit ? 1 : 0.74);
+    });
+  }
+
   private pickVrButton(controller: THREE.Group): VrButtonMesh | undefined {
     if (!this.vrPanelVisible || this.vrPanelButtons.length === 0) {
       return undefined;
@@ -830,6 +902,19 @@ export class BroadStreetScene {
     this.setRaycasterFromController(controller);
     const hit = this.controllerRaycaster.intersectObjects(this.vrPanelButtons, false)[0];
     return hit ? (hit.object as VrButtonMesh) : undefined;
+  }
+
+  private pickVrPointerHit(controller: THREE.Group): THREE.Intersection<THREE.Object3D> | undefined {
+    this.setRaycasterFromController(controller);
+    const buttonHit = this.vrPanelVisible
+      ? this.controllerRaycaster.intersectObjects(this.vrPanelButtons, false)[0]
+      : undefined;
+    if (buttonHit) {
+      return buttonHit;
+    }
+
+    const visibleHotspots = [...this.hotspotVisuals.values()].map((visual) => visual.mesh).filter((mesh) => mesh.visible);
+    return this.controllerRaycaster.intersectObjects(visibleHotspots, false)[0];
   }
 
   private pickVrHotspot(controller: THREE.Group): Hotspot | undefined {
@@ -925,20 +1010,39 @@ export class BroadStreetScene {
   }
 }
 
-function createControllerRay(): THREE.Line {
-  const geometry = new THREE.BufferGeometry().setFromPoints([
-    new THREE.Vector3(0, 0, 0),
-    new THREE.Vector3(0, 0, -4.5),
-  ]);
-  const material = new THREE.LineBasicMaterial({
+function createControllerPointer(): VrControllerPointer {
+  const group = new THREE.Group();
+  const beamGeometry = new THREE.CylinderGeometry(0.008, 0.012, 1, 12, 1, true);
+  beamGeometry.rotateX(Math.PI / 2);
+  const beamMaterial = new THREE.MeshBasicMaterial({
     color: "#f4d891",
     transparent: true,
-    opacity: 0.82,
+    opacity: 0.72,
+    depthTest: false,
     toneMapped: false,
   });
-  const line = new THREE.Line(geometry, material);
-  line.renderOrder = 80;
-  return line;
+  const beam = new THREE.Mesh(beamGeometry, beamMaterial);
+  beam.position.z = -2.25;
+  beam.scale.set(1, 1, 4.5);
+  beam.renderOrder = 90;
+  group.add(beam);
+
+  const reticle = new THREE.Mesh(
+    new THREE.RingGeometry(0.035, 0.054, 28),
+    new THREE.MeshBasicMaterial({
+      color: "#f4d891",
+      transparent: true,
+      opacity: 0.75,
+      depthTest: false,
+      side: THREE.DoubleSide,
+      toneMapped: false,
+    }),
+  );
+  reticle.position.z = -4.5;
+  reticle.renderOrder = 92;
+  group.add(reticle);
+
+  return { group, beam, reticle };
 }
 
 function createVrTextPlane(text: string, width: number, height: number, options: VrTextOptions = {}): THREE.Mesh {
