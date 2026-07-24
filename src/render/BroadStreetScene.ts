@@ -33,13 +33,17 @@ export class BroadStreetScene {
   private readonly hotspotWorldPosition = new THREE.Vector3();
   private readonly hotspotVisuals = new Map<string, HotspotVisual>();
   private readonly locationObjects = new Map<LocationId, THREE.Object3D[]>();
+  private readonly sharedExterior = new THREE.Group();
   private readonly fallbackPanoramaTexture = createPanoramaTexture();
   private readonly skyMaterial = new THREE.MeshBasicMaterial({
     map: this.fallbackPanoramaTexture,
     side: THREE.BackSide,
+    fog: false,
+    toneMapped: false,
   });
   private readonly panoramaLoader = new THREE.TextureLoader();
   private readonly panoramaTextureCache = new Map<LocationId, THREE.Texture | null>();
+  private readonly locationsWithLoadedPanorama = new Set<LocationId>();
   private readonly allowCanvasCapture: boolean;
   private activePanoramaLocationId?: LocationId;
   private focusedHotspot?: Hotspot;
@@ -142,8 +146,9 @@ export class BroadStreetScene {
     );
     this.scene.add(sky);
 
-    this.scene.add(createGround());
-    this.scene.add(createDistantStreetSilhouette());
+    this.sharedExterior.add(createGround());
+    this.sharedExterior.add(createDistantStreetSilhouette());
+    this.scene.add(this.sharedExterior);
 
     this.scene.add(new THREE.HemisphereLight("#d7eef4", "#332c23", 1.45));
     const lantern = new THREE.PointLight("#f4b468", 55, 14, 1.6);
@@ -196,28 +201,35 @@ export class BroadStreetScene {
 
     const cachedTexture = this.panoramaTextureCache.get(locationId);
     if (cachedTexture) {
+      this.locationsWithLoadedPanorama.add(locationId);
       this.setSkyTexture(cachedTexture);
       return;
     }
 
     if (cachedTexture === null) {
+      this.locationsWithLoadedPanorama.delete(locationId);
       return;
     }
 
+    this.locationsWithLoadedPanorama.delete(locationId);
     this.panoramaLoader.load(
       resolvePublicAssetPath(panoramaAssetPaths[locationId]),
-      (texture) => {
-        preparePanoramaTexture(texture);
+      (loadedTexture) => {
+        const texture = createDisplayPanoramaTexture(loadedTexture);
         this.panoramaTextureCache.set(locationId, texture);
+        this.locationsWithLoadedPanorama.add(locationId);
         if (this.activePanoramaLocationId === locationId) {
           this.setSkyTexture(texture);
+          this.refreshLocationObjects();
         }
       },
       undefined,
       () => {
         this.panoramaTextureCache.set(locationId, null);
+        this.locationsWithLoadedPanorama.delete(locationId);
         if (this.activePanoramaLocationId === locationId) {
           this.setSkyTexture(this.fallbackPanoramaTexture);
+          this.refreshLocationObjects();
         }
       },
     );
@@ -343,10 +355,13 @@ export class BroadStreetScene {
 
   private refreshLocationObjects(): void {
     const currentLocationId = this.gameState.getCurrentLocation().id;
+    const currentLocationHasPanorama = this.locationsWithLoadedPanorama.has(currentLocationId);
+    this.sharedExterior.visible = !currentLocationHasPanorama;
     this.locationObjects.forEach((objects, locationId) => {
       const visible = locationId === currentLocationId;
       objects.forEach((object) => {
         object.visible = visible;
+        setEnvironmentShellVisibility(object, !(visible && currentLocationHasPanorama));
       });
     });
   }
@@ -385,6 +400,40 @@ function preparePanoramaTexture(texture: THREE.Texture): void {
   texture.repeat.x = -1;
   texture.offset.x = 1;
   texture.needsUpdate = true;
+}
+
+function createDisplayPanoramaTexture(sourceTexture: THREE.Texture): THREE.CanvasTexture {
+  const image = sourceTexture.image as HTMLImageElement;
+  const width = image.naturalWidth || image.width || 2048;
+  const height = image.naturalHeight || image.height || 1024;
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) {
+    throw new Error("Could not prepare panorama texture.");
+  }
+
+  ctx.filter = "contrast(1.1) saturate(1.18) brightness(1.04)";
+  ctx.drawImage(image, 0, 0, width, height);
+  sourceTexture.dispose();
+
+  const texture = new THREE.CanvasTexture(canvas);
+  preparePanoramaTexture(texture);
+  return texture;
+}
+
+function markEnvironmentShell<T extends THREE.Object3D>(object: T): T {
+  object.userData.isEnvironmentShell = true;
+  return object;
+}
+
+function setEnvironmentShellVisibility(object: THREE.Object3D, visible: boolean): void {
+  object.traverse((child) => {
+    if (child.userData.isEnvironmentShell === true) {
+      child.visible = visible;
+    }
+  });
 }
 
 function createHotspotMesh(hotspot: Hotspot): HotspotMesh {
@@ -507,24 +556,6 @@ function createBroadStreetSet(): THREE.Group {
   const group = new THREE.Group();
   group.position.set(0, 0, -4.2);
 
-  const street = createMaterial("#3b3934", { map: createCobbleTexture(), roughness: 0.98 });
-  const curb = createMaterial("#8a8272", { roughness: 0.91 });
-  const brick = createMaterial("#6b4439", { roughness: 0.94 });
-  const sootBrick = createMaterial("#44352f", { roughness: 0.96 });
-  const darkWood = createMaterial("#31241d", { roughness: 0.85 });
-  const windowMat = createMaterial("#d79f57", { emissive: "#8e5b24", emissiveIntensity: 0.2, roughness: 0.45 });
-
-  const streetMesh = createBox([5.4, 0.035, 3.8], street, [0, 0, -0.2]);
-  streetMesh.receiveShadow = true;
-  group.add(streetMesh);
-  group.add(createBox([0.16, 0.13, 3.9], curb, [-2.72, 0.055, -0.2], [0, 0.03, 0]));
-  group.add(createBox([0.16, 0.13, 3.9], curb, [2.72, 0.055, -0.2], [0, -0.03, 0]));
-  group.add(createFacade([0, 1.22, -1.96], [5.6, 2.45, 0.18], brick, windowMat, 5, 2, 0));
-  group.add(createFacade([-2.85, 1.1, -0.15], [0.18, 2.2, 3.45], sootBrick, windowMat, 3, 2, 0));
-  group.add(createFacade([2.85, 1.1, -0.15], [0.18, 2.2, 3.45], brick, windowMat, 3, 2, 0));
-  group.add(createBox([0.86, 1.15, 0.08], darkWood, [-1.45, 0.58, -1.84]));
-  group.add(createBox([0.6, 0.82, 0.08], darkWood, [1.5, 0.42, -1.84]));
-
   const streetSign = createSignMesh("BROAD STREET", 1.28, 0.28, "#e0d2aa", "#2b241c");
   streetSign.position.set(-1.25, 1.86, -1.86);
   group.add(streetSign);
@@ -637,16 +668,18 @@ function createWorkhouseSet(): THREE.Group {
   const wood = createMaterial("#382820", { roughness: 0.87 });
   const water = createMaterial("#315657", { transparent: true, opacity: 0.68, roughness: 0.4 });
 
-  group.add(createBox([4.8, 0.04, 3.2], createMaterial("#383731", { roughness: 0.98 }), [0, 0, -0.12]));
-  group.add(createFacade([0, 1.18, 1.35], [4.6, 2.35, 0.2], brick, createMaterial("#c79557", { roughness: 0.55 }), 4, 2, 0));
-  group.add(createBox([1.1, 1.22, 0.12], wood, [0, 0.62, 1.23]));
-  group.add(createBox([4.9, 0.22, 0.24], soot, [0, 2.4, 1.34]));
-  group.add(createBox([0.16, 1.0, 2.6], brick, [-2.36, 0.5, -0.2]));
-  group.add(createBox([0.16, 1.0, 2.6], brick, [2.36, 0.5, -0.2]));
-  group.add(createBox([3.25, 0.18, 0.12], stone, [0, 0.16, -1.36]));
-  group.add(createBox([0.12, 1.05, 0.1], wood, [-0.95, 0.55, -1.24]));
-  group.add(createBox([0.12, 1.05, 0.1], wood, [0.95, 0.55, -1.24]));
-  group.add(createBox([1.95, 0.09, 0.08], wood, [0, 1.08, -1.24]));
+  const shell = markEnvironmentShell(new THREE.Group());
+  shell.add(createBox([4.8, 0.04, 3.2], createMaterial("#383731", { roughness: 0.98 }), [0, 0, -0.12]));
+  shell.add(createFacade([0, 1.18, 1.35], [4.6, 2.35, 0.2], brick, createMaterial("#c79557", { roughness: 0.55 }), 4, 2, 0));
+  shell.add(createBox([1.1, 1.22, 0.12], wood, [0, 0.62, 1.23]));
+  shell.add(createBox([4.9, 0.22, 0.24], soot, [0, 2.4, 1.34]));
+  shell.add(createBox([0.16, 1.0, 2.6], brick, [-2.36, 0.5, -0.2]));
+  shell.add(createBox([0.16, 1.0, 2.6], brick, [2.36, 0.5, -0.2]));
+  shell.add(createBox([3.25, 0.18, 0.12], stone, [0, 0.16, -1.36]));
+  shell.add(createBox([0.12, 1.05, 0.1], wood, [-0.95, 0.55, -1.24]));
+  shell.add(createBox([0.12, 1.05, 0.1], wood, [0.95, 0.55, -1.24]));
+  shell.add(createBox([1.95, 0.09, 0.08], wood, [0, 1.08, -1.24]));
+  group.add(shell);
 
   const ownSupply = createBox([0.9, 0.64, 0.72], stone, [1.25, 0.34, -0.35]);
   group.add(ownSupply);
@@ -674,7 +707,7 @@ function createBrewerySet(): THREE.Group {
   const stone = createMaterial("#413b33", { roughness: 0.98 });
 
   group.add(createRoomShell(4.8, 3.2, "#3a2925", "#2a2924", "#7a4c2a"));
-  group.add(createBox([4.2, 0.04, 2.75], stone, [0, 0.012, -0.1]));
+  group.add(markEnvironmentShell(createBox([4.2, 0.04, 2.75], stone, [0, 0.012, -0.1])));
   group.add(createVat([-1.15, 0.02, 0.3], copper));
   group.add(createVat([1.18, 0.02, 0.26], copper));
   group.add(createBarrel([-0.1, 0.38, -0.72], 1.15));
@@ -865,7 +898,7 @@ function createRoomShell(
   group.add(createBox([width, 0.08, 0.14], trim, [0, 0.62, depth / 2 + 0.18]));
   group.add(createBox([0.16, 0.08, depth], trim, [-width / 2 + 0.04, 0.62, 0.25]));
   group.add(createBox([0.16, 0.08, depth], trim, [width / 2 - 0.04, 0.62, 0.25]));
-  return group;
+  return markEnvironmentShell(group);
 }
 
 function createFacade(
