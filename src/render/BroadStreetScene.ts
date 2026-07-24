@@ -740,29 +740,31 @@ function createSnowDeskSet(): THREE.Group {
   const darkWood = createMaterial("#2a1f19", { roughness: 0.82 });
   const paper = createMaterial("#d7c79d", { roughness: 0.76 });
   const redPin = createMaterial("#8d2f26", { emissive: "#5c1712", emissiveIntensity: 0.18, roughness: 0.55 });
+  const generatedDeskProps = markEnvironmentShell(new THREE.Group());
 
   group.add(createRoomShell(6.0, 3.6, "#322820", "#24241f", "#805638"));
-  group.add(createMapTable());
   group.add(createSnowFigure());
-  group.add(createBookStack([0.95, 0.88, -0.34]));
-  group.add(createPaperStack([-0.7, 0.875, 0.22], 5, 1));
-  group.add(createInkBottle([-0.92, 0.9, -0.25]));
-  group.add(createDeskLamp([0.58, 0.91, 0.28]));
+  generatedDeskProps.add(createMapTable());
+  generatedDeskProps.add(createBookStack([0.95, 0.88, -0.34]));
+  generatedDeskProps.add(createPaperStack([-0.7, 0.875, 0.22], 5, 1));
+  generatedDeskProps.add(createInkBottle([-0.92, 0.9, -0.25]));
+  generatedDeskProps.add(createDeskLamp([0.58, 0.91, 0.28]));
 
   const wallMap = createBox([1.65, 1.04, 0.04], paper, [1.65, 1.46, 1.7]);
-  group.add(wallMap);
-  group.add(createBox([1.78, 1.17, 0.07], darkWood, [1.65, 1.46, 1.73]));
+  generatedDeskProps.add(wallMap);
+  generatedDeskProps.add(createBox([1.78, 1.17, 0.07], darkWood, [1.65, 1.46, 1.73]));
   for (let index = 0; index < 13; index += 1) {
     const pin = createCylinder(0.025, 0.025, 0.016, redPin, [
       1.05 + ((index * 53) % 120) / 100,
       1.14 + ((index * 31) % 68) / 100,
       1.675,
     ], [Math.PI / 2, 0, 0], 12);
-    group.add(pin);
+    generatedDeskProps.add(pin);
   }
-  group.add(createShelf([-2.2, 1.12, 1.3], darkWood, paper, 4));
-  group.add(createBox([0.92, 0.08, 0.92], wood, [-1.65, 0.42, -0.48]));
-  group.add(createBox([0.14, 0.52, 0.14], wood, [-1.65, 0.2, -0.48]));
+  generatedDeskProps.add(createShelf([-2.2, 1.12, 1.3], darkWood, paper, 4));
+  generatedDeskProps.add(createBox([0.92, 0.08, 0.92], wood, [-1.65, 0.42, -0.48]));
+  generatedDeskProps.add(createBox([0.14, 0.52, 0.14], wood, [-1.65, 0.2, -0.48]));
+  group.add(generatedDeskProps);
   group.add(createPointLight("#efbd74", 62, 6, [0.5, 2.0, 0.05]));
   return group;
 }
