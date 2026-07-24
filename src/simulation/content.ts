@@ -403,7 +403,7 @@ export const hotspots: Hotspot[] = [
     shortLabel: "Pump",
     description: "A much-used public pump stands at the center of the first cluster.",
     evidenceId: "pump-cluster",
-    position: [1.45, 1.45, -4.2],
+    position: [1.45, 1.45, -5.4],
   },
   {
     id: "registrar-ledger",

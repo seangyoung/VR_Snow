@@ -369,7 +369,7 @@ export class BroadStreetScene {
 
 const locationLookTargets: Record<LocationId, [number, number, number]> = {
   "snow-desk": [-2.8, 1.35, 2.4],
-  "broad-street": [0.8, 1.1, -4.2],
+  "broad-street": [0.8, 1.1, -5.4],
   household: [-2.25, 1.18, -0.95],
   registrar: [-3.2, 1.1, -2.2],
   workhouse: [3.6, 1.2, -1.7],
@@ -554,7 +554,7 @@ function createDistantStreetSilhouette(): THREE.Group {
 
 function createBroadStreetSet(): THREE.Group {
   const group = new THREE.Group();
-  group.position.set(0, 0, -4.2);
+  group.position.set(0, 0, -5.4);
   const pumpX = 1.45;
 
   const streetSign = createSignMesh("BROAD STREET", 1.28, 0.28, "#e0d2aa", "#2b241c");
@@ -644,7 +644,6 @@ function createHouseholdSet(): THREE.Group {
   group.add(createPaperStack([0.84, 0.75, -0.48], 3, 0.82));
 
   group.add(createChair([1.35, 0.02, 0.36], -0.55));
-  group.add(createHouseholdWitness([1.35, 0.02, 0.36], -0.55));
 
   group.add(createBox([0.92, 0.08, 0.08], blackCloth, [-1.78, 1.54, 1.56]));
   group.add(createBox([0.08, 0.62, 0.06], blackCloth, [-1.78, 1.24, 1.55]));
